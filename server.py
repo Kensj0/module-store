@@ -76,9 +76,9 @@ ALLOWED_ORIGINS = {
     "http://127.0.0.1:8792",
 }
 ALLOWED_HOSTS = {f"{HOST}:{PORT}", f"localhost:{PORT}"}
-ACTION_PATH = re.compile(r"^/(update|undo|restart)/([a-z-]+)$")
-INSTALL_PATH = re.compile(r"^/install/([a-z-]+)$")
-LOG_PATH = re.compile(r"^/logs/([a-z-]+)$")
+ACTION_PATH = re.compile(r"^/(update|undo|restart)/([a-z0-9-]+)$")
+INSTALL_PATH = re.compile(r"^/install/([a-z0-9-]+)$")
+LOG_PATH = re.compile(r"^/logs/([a-z0-9-]+)$")
 
 
 def git(*args, timeout=60):
@@ -123,17 +123,17 @@ def restart(unit):
 
 def status():
     git("fetch", "--quiet", "origin", "main", timeout=30)
-    services = {}
+    found = {}
     for name, (directory, _unit) in services().items():
         version = installed(name)
         latest = latest_version(directory)
-        services[name] = {
+        found[name] = {
             "version": version,
             "latest": latest,
             "updateAvailable": version != latest,
             "canUndo": can_undo(name),
         }
-    return {"services": services}
+    return {"services": found}
 
 
 def copy_folder_into(staging, name, directory, ref="origin/main"):
