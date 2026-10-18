@@ -101,7 +101,8 @@ def installed(name):
 
 
 def can_undo(name):
-    return os.path.isfile(os.path.join(service_dir(name), "previous", "server.py"))
+    previous = os.path.join(service_dir(name), "previous")
+    return os.path.isdir(previous) and any(f.endswith(".py") for f in os.listdir(previous))
 
 
 def restart(unit):
@@ -136,9 +137,11 @@ def update(name):
     staging = os.path.join(base, "staging")
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging)
-    code = git("show", f"origin/main:{directory}/server.py")
-    with open(os.path.join(staging, "server.py"), "w", encoding="utf-8") as file:
-        file.write(code + "\n")
+    # Copy every tracked file in the app folder, so apps with more than one file work too.
+    for path in git("ls-tree", "-r", "--name-only", "origin/main", "--", directory).splitlines():
+        content = git("show", f"origin/main:{path}")
+        with open(os.path.join(staging, os.path.basename(path)), "w", encoding="utf-8") as file:
+            file.write(content + "\n")
     with open(os.path.join(staging, "version.txt"), "w", encoding="utf-8") as file:
         file.write(latest + "\n")
 
