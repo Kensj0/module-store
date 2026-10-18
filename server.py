@@ -19,7 +19,7 @@ How it works: each service runs from its own folder, not from the git checkout.
 Update copies the latest code from origin/main into the folder and makes it current.
 Undo swaps current and previous. Git is only read, never changed.
 
-Only the services in SERVICES can be updated. Binds to 127.0.0.1 and accepts requests
+Only installed services can be updated. Binds to 127.0.0.1 and accepts requests
 from the same allowed origins as the other services.
 """
 
@@ -50,12 +50,22 @@ def load_apps():
         return json.load(file)["apps"]
 
 
-# Services that can be updated, read from apps.json: name -> (folder, systemd unit).
-SERVICES = {
-    app["id"]: (app["dir"], app["unit"])
-    for app in load_apps()
-    if app["kind"] == "service"
-}
+def installed_state():
+    return read_json("installed.json", {})
+
+
+def app_installed(app):
+    # apps.json may say installed; installs done from the panel are kept in the state folder.
+    return installed_state().get(app["id"], app.get("installed", True))
+
+
+# Installed services that can be updated: name -> (folder, systemd unit).
+def services():
+    return {
+        app["id"]: (app["dir"], app["unit"])
+        for app in load_apps()
+        if app["kind"] == "service" and app_installed(app)
+    }
 ALLOWED_ORIGINS = {
     "tauri://localhost",
     "http://tauri.localhost",
@@ -67,6 +77,7 @@ ALLOWED_ORIGINS = {
 }
 ALLOWED_HOSTS = {f"{HOST}:{PORT}", f"localhost:{PORT}"}
 ACTION_PATH = re.compile(r"^/(update|undo|restart)/([a-z-]+)$")
+INSTALL_PATH = re.compile(r"^/install/([a-z-]+)$")
 LOG_PATH = re.compile(r"^/logs/([a-z-]+)$")
 
 
@@ -113,7 +124,7 @@ def restart(unit):
 def status():
     git("fetch", "--quiet", "origin", "main", timeout=30)
     services = {}
-    for name, (directory, _unit) in SERVICES.items():
+    for name, (directory, _unit) in services().items():
         version = installed(name)
         latest = latest_version(directory)
         services[name] = {
@@ -125,8 +136,62 @@ def status():
     return {"services": services}
 
 
+def copy_folder_into(staging, name, directory, ref="origin/main"):
+    """Write every tracked file of an app folder, from git, into the staging folder."""
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    for path in git("ls-tree", "-r", "--name-only", ref, "--", directory).splitlines():
+        content = git("show", f"{ref}:{path}")
+        with open(os.path.join(staging, os.path.basename(path)), "w", encoding="utf-8") as file:
+            file.write(content + "\n")
+
+
+def install(name):
+    """Install an app that is listed but not yet installed: copy it, add its unit, start it."""
+    app = next((a for a in load_apps() if a["id"] == name), None)
+    if app is None or app["kind"] != "service":
+        raise RuntimeError("not an installable service")
+    if app_installed(app):
+        return {"ok": True, "installed": True}
+    git("fetch", "--quiet", "origin", "main", timeout=30)
+    directory, unit = app["dir"], app["unit"]
+    entry = app.get("entry", "server.py")
+    latest = latest_version(directory)
+    if latest == "unknown":
+        raise RuntimeError("the app is not on GitHub yet, push it first")
+
+    base = service_dir(name)
+    os.makedirs(base, exist_ok=True)
+    copy_folder_into(os.path.join(base, "current"), name, directory)
+    if not os.path.isfile(os.path.join(base, "current", entry)):
+        raise RuntimeError(f"{entry} is missing in {directory}")
+    with open(os.path.join(base, "current.version"), "w", encoding="utf-8") as file:
+        file.write(latest + "\n")
+
+    unit_dir = os.path.expanduser("~/.config/systemd/user")
+    os.makedirs(unit_dir, exist_ok=True)
+    unit_text = (
+        "[Unit]\n"
+        f"Description=Jarri {app['title']} (installed by the module store)\n\n"
+        "[Service]\n"
+        f"ExecStart=/usr/bin/python3 -I %h/.local/share/jarri-apps/{name}/current/{entry}\n"
+        "Restart=on-failure\n\n"
+        "[Install]\nWantedBy=default.target\n"
+    )
+    with open(os.path.join(unit_dir, f"{unit}.service"), "w", encoding="utf-8") as file:
+        file.write(unit_text)
+    if not SKIP_RESTART:
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True, timeout=30)
+        subprocess.run(["systemctl", "--user", "enable", "--now", unit], check=True, timeout=30)
+
+    state = installed_state()
+    state[name] = True
+    write_json("installed.json", state)
+    return {"ok": True, "installed": True, "version": latest}
+
+
 def update(name):
-    directory, unit = SERVICES[name]
+    directory, unit = services()[name]
     git("fetch", "--quiet", "origin", "main", timeout=30)
     latest = latest_version(directory)
     base = service_dir(name)
@@ -160,7 +225,7 @@ def update(name):
 
 
 def undo(name):
-    _directory, unit = SERVICES[name]
+    _directory, unit = services()[name]
     if not can_undo(name):
         raise RuntimeError("nothing to undo")
     base = service_dir(name)
@@ -235,13 +300,13 @@ def background_checks():
 
 
 def restart_service(name):
-    _directory, unit = SERVICES[name]
+    _directory, unit = services()[name]
     restart(unit)
     return {"ok": True}
 
 
 def service_log(name):
-    _directory, unit = SERVICES[name]
+    _directory, unit = services()[name]
     result = subprocess.run(
         ["journalctl", "--user", "-u", unit, "-n", "20", "--no-pager", "-o", "cat"],
         capture_output=True, text=True, timeout=20,
@@ -291,14 +356,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/settings":
             return self._send(200, {"notify": notifications_on()})
         log_match = LOG_PATH.match(path)
-        if log_match and log_match.group(1) in SERVICES:
+        if log_match and log_match.group(1) in services():
             try:
                 return self._send(200, service_log(log_match.group(1)))
             except Exception as error:
                 return self._send(500, {"error": str(error)})
         if path == "/apps":
             try:
-                self._send(200, {"apps": load_apps()})
+                apps = [dict(app, installed=app_installed(app)) for app in load_apps()]
+                self._send(200, {"apps": apps})
             except Exception as error:
                 self._send(500, {"error": str(error)})
             return
@@ -318,8 +384,14 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length) or b"{}")
             write_json("settings.json", {"notify": bool(body.get("notify", True))})
             return self._send(200, {"notify": notifications_on()})
+        install_match = INSTALL_PATH.match(path)
+        if install_match:
+            try:
+                return self._send(200, install(install_match.group(1)))
+            except Exception as error:
+                return self._send(500, {"error": str(error)})
         match = ACTION_PATH.match(path)
-        if not match or match.group(2) not in SERVICES:
+        if not match or match.group(2) not in services():
             return self._send(404, {"error": "unknown service"})
         action, name = match.group(1), match.group(2)
         try:
