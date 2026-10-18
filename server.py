@@ -2,6 +2,7 @@
 
 Backend only. The module store panel in Jarri is a client of this service.
 
+  GET  /apps              -> {apps: [...]}, the list in apps.json
   GET  /status            -> {services: {name: {version, latest, updateAvailable, canUndo}}}
   POST /update/{name}     -> {ok, updated, version}
   POST /undo/{name}       -> {ok, version}
@@ -32,12 +33,19 @@ PORT = int(os.environ.get("JARRI_MODULE_STORE_PORT", "8785"))
 REPO = os.path.expanduser(os.environ.get("JARRI_APPS_DIR", "~/projects/jarri-apps"))
 INSTALL_ROOT = os.path.expanduser(os.environ.get("JARRI_INSTALL_ROOT", "~/.local/share/jarri-apps"))
 SKIP_RESTART = os.environ.get("JARRI_SKIP_RESTART") == "1"  # for tests only
+APPS_FILE = os.path.join(REPO, "apps.json")
+
+
+def load_apps():
+    with open(APPS_FILE, encoding="utf-8") as file:
+        return json.load(file)["apps"]
+
+
+# Services that can be updated, read from apps.json: name -> (folder, systemd unit).
 SERVICES = {
-    "terminal": ("terminal-service", "jarri-terminal"),
-    "phone": ("phone-service", "jarri-phone"),
-    "ai-usage": ("ai-usage-service", "jarri-ai-usage"),
-    "claude-history": ("claude-history-service", "jarri-claude-history"),
-    "browser": ("browser-service", "jarri-browser"),
+    app["id"]: (app["dir"], app["unit"])
+    for app in load_apps()
+    if app["kind"] == "service"
 }
 ALLOWED_ORIGINS = {
     "tauri://localhost",
@@ -202,7 +210,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if not self._allowed():
             return self._send(403, {"error": "forbidden origin"})
-        if urlparse(self.path).path != "/status":
+        path = urlparse(self.path).path
+        if path == "/apps":
+            try:
+                self._send(200, {"apps": load_apps()})
+            except Exception as error:
+                self._send(500, {"error": str(error)})
+            return
+        if path != "/status":
             return self._send(404, {"error": "not found"})
         try:
             self._send(200, status())
