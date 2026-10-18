@@ -2,17 +2,26 @@
 
 Backend only. The module store panel in Jarri is a client of this service.
 
-  GET  /status            -> {services: {name: {version, latest, updateAvailable}}}
+  GET  /status            -> {services: {name: {version, latest, updateAvailable, canUndo}}}
   POST /update/{name}     -> {ok, updated, version}
+  POST /undo/{name}       -> {ok, version}
 
-Only the services listed in SERVICES can be updated. Updates are fast-forward pulls
-of origin/main followed by a restart of that one service. Nothing else is run.
-Binds to 127.0.0.1 only and accepts requests from the same allowed origins as the other services.
+How it works: each service runs from its own folder, not from the git checkout.
+
+  ~/.local/share/jarri-apps/<name>/current/server.py   runs now
+  ~/.local/share/jarri-apps/<name>/previous/server.py  the version before the last update
+
+Update copies the latest code from origin/main into the folder and makes it current.
+Undo swaps current and previous. Git is only read, never changed.
+
+Only the services in SERVICES can be updated. Binds to 127.0.0.1 and accepts requests
+from the same allowed origins as the other services.
 """
 
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -21,6 +30,8 @@ from urllib.parse import urlparse
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("JARRI_MODULE_STORE_PORT", "8785"))
 REPO = os.path.expanduser(os.environ.get("JARRI_APPS_DIR", "~/projects/jarri-apps"))
+INSTALL_ROOT = os.path.expanduser(os.environ.get("JARRI_INSTALL_ROOT", "~/.local/share/jarri-apps"))
+SKIP_RESTART = os.environ.get("JARRI_SKIP_RESTART") == "1"  # for tests only
 SERVICES = {
     "terminal": ("terminal-service", "jarri-terminal"),
     "phone": ("phone-service", "jarri-phone"),
@@ -37,7 +48,7 @@ ALLOWED_ORIGINS = {
     "http://127.0.0.1:8792",
 }
 ALLOWED_HOSTS = {f"{HOST}:{PORT}", f"localhost:{PORT}"}
-UPDATE_PATH = re.compile(r"^/update/([a-z-]+)$")
+ACTION_PATH = re.compile(r"^/(update|undo)/([a-z-]+)$")
 
 
 def git(*args, timeout=60):
@@ -49,32 +60,107 @@ def git(*args, timeout=60):
     return result.stdout.strip()
 
 
-def version_of(directory, ref="HEAD"):
-    return git("log", "-1", "--format=%h", ref, "--", directory) or "unknown"
+def latest_version(directory):
+    return git("log", "-1", "--format=%h", "origin/main", "--", directory) or "unknown"
+
+
+def service_dir(name):
+    return os.path.join(INSTALL_ROOT, name)
+
+
+def read_version(path):
+    try:
+        with open(path, encoding="utf-8") as file:
+            return file.read().strip()
+    except OSError:
+        return "unknown"
+
+
+def installed(name):
+    base = service_dir(name)
+    return read_version(os.path.join(base, "current.version"))
+
+
+def can_undo(name):
+    return os.path.isfile(os.path.join(service_dir(name), "previous", "server.py"))
+
+
+def restart(unit):
+    if not SKIP_RESTART:
+        subprocess.run(["systemctl", "--user", "restart", unit], check=True, timeout=30)
 
 
 def status():
     git("fetch", "--quiet", "origin", "main", timeout=30)
     services = {}
     for name, (directory, _unit) in SERVICES.items():
-        changed = git("diff", "--name-only", "HEAD", "origin/main", "--", directory)
+        version = installed(name)
+        latest = latest_version(directory)
         services[name] = {
-            "version": version_of(directory),
-            "latest": version_of(directory, "origin/main"),
-            "updateAvailable": bool(changed),
+            "version": version,
+            "latest": latest,
+            "updateAvailable": version != latest,
+            "canUndo": can_undo(name),
         }
     return {"services": services}
 
 
 def update(name):
     directory, unit = SERVICES[name]
-    before = version_of(directory)
-    git("pull", "--ff-only", "origin", "main")
-    after = version_of(directory)
-    if before == after:
-        return {"ok": True, "updated": False, "version": after}
-    subprocess.run(["systemctl", "--user", "restart", unit], check=True, timeout=30)
-    return {"ok": True, "updated": True, "version": after}
+    git("fetch", "--quiet", "origin", "main", timeout=30)
+    latest = latest_version(directory)
+    base = service_dir(name)
+    if installed(name) == latest:
+        return {"ok": True, "updated": False, "version": latest}
+
+    # Build the new version next to the current one, then swap it in.
+    staging = os.path.join(base, "staging")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging)
+    code = git("show", f"origin/main:{directory}/server.py")
+    with open(os.path.join(staging, "server.py"), "w", encoding="utf-8") as file:
+        file.write(code + "\n")
+    with open(os.path.join(staging, "version.txt"), "w", encoding="utf-8") as file:
+        file.write(latest + "\n")
+
+    previous = os.path.join(base, "previous")
+    current = os.path.join(base, "current")
+    shutil.rmtree(previous, ignore_errors=True)
+    if os.path.isdir(current):
+        os.rename(current, previous)
+        shutil.copy(os.path.join(base, "current.version"), os.path.join(base, "previous.version"))
+    os.rename(staging, current)
+    with open(os.path.join(base, "current.version"), "w", encoding="utf-8") as file:
+        file.write(latest + "\n")
+
+    restart(unit)
+    return {"ok": True, "updated": True, "version": latest}
+
+
+def undo(name):
+    _directory, unit = SERVICES[name]
+    if not can_undo(name):
+        raise RuntimeError("nothing to undo")
+    base = service_dir(name)
+    current = os.path.join(base, "current")
+    previous = os.path.join(base, "previous")
+    swap = os.path.join(base, "swap")
+
+    # Swap the two folders. Nothing is deleted.
+    shutil.rmtree(swap, ignore_errors=True)
+    os.rename(current, swap)
+    os.rename(previous, current)
+    os.rename(swap, previous)
+
+    current_version = os.path.join(base, "current.version")
+    previous_version = os.path.join(base, "previous.version")
+    tmp = os.path.join(base, "version.tmp")
+    shutil.copy(current_version, tmp)
+    shutil.copy(previous_version, current_version)
+    shutil.move(tmp, previous_version)
+
+    restart(unit)
+    return {"ok": True, "version": installed(name)}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -125,11 +211,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._allowed():
             return self._send(403, {"error": "forbidden origin"})
-        match = UPDATE_PATH.match(urlparse(self.path).path)
-        if not match or match.group(1) not in SERVICES:
+        match = ACTION_PATH.match(urlparse(self.path).path)
+        if not match or match.group(2) not in SERVICES:
             return self._send(404, {"error": "unknown service"})
+        action, name = match.group(1), match.group(2)
         try:
-            self._send(200, update(match.group(1)))
+            result = update(name) if action == "update" else undo(name)
+            self._send(200, result)
         except Exception as error:
             self._send(500, {"error": str(error)})
 
