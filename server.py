@@ -37,6 +37,7 @@ SERVICES = {
     "phone": ("phone-service", "jarri-phone"),
     "ai-usage": ("ai-usage-service", "jarri-ai-usage"),
     "claude-history": ("claude-history-service", "jarri-claude-history"),
+    "browser": ("browser-service", "jarri-browser"),
 }
 ALLOWED_ORIGINS = {
     "tauri://localhost",
