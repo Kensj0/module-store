@@ -3,6 +3,10 @@
 Backend only. The module store panel in Jarri is a client of this service.
 
   GET  /apps              -> {apps: [...]}, the list in apps.json
+  GET  /settings          -> {notify}
+  POST /settings          {notify} -> {notify}
+  GET  /logs/{name}       -> {lines}, the last 20 log lines
+  POST /restart/{name}    -> {ok}
   GET  /status            -> {services: {name: {version, latest, updateAvailable, canUndo}}}
   POST /update/{name}     -> {ok, updated, version}
   POST /undo/{name}       -> {ok, version}
@@ -25,6 +29,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 
@@ -33,6 +39,9 @@ PORT = int(os.environ.get("JARRI_MODULE_STORE_PORT", "8785"))
 REPO = os.path.expanduser(os.environ.get("JARRI_APPS_DIR", "~/projects/jarri-apps"))
 INSTALL_ROOT = os.path.expanduser(os.environ.get("JARRI_INSTALL_ROOT", "~/.local/share/jarri-apps"))
 SKIP_RESTART = os.environ.get("JARRI_SKIP_RESTART") == "1"  # for tests only
+STATE_DIR = os.path.expanduser(os.environ.get("JARRI_STATE_DIR", "~/.local/state/jarri/module-store"))
+NOTIFY_CMD = os.environ.get("JARRI_NOTIFY_CMD", "notify-send")
+CHECK_EVERY_S = int(os.environ.get("JARRI_CHECK_EVERY_S", str(30 * 60)))
 APPS_FILE = os.path.join(REPO, "apps.json")
 
 
@@ -57,7 +66,8 @@ ALLOWED_ORIGINS = {
     "http://127.0.0.1:8792",
 }
 ALLOWED_HOSTS = {f"{HOST}:{PORT}", f"localhost:{PORT}"}
-ACTION_PATH = re.compile(r"^/(update|undo)/([a-z-]+)$")
+ACTION_PATH = re.compile(r"^/(update|undo|restart)/([a-z-]+)$")
+LOG_PATH = re.compile(r"^/logs/([a-z-]+)$")
 
 
 def git(*args, timeout=60):
@@ -172,6 +182,70 @@ def undo(name):
     return {"ok": True, "version": installed(name)}
 
 
+def read_json(name, default):
+    try:
+        with open(os.path.join(STATE_DIR, name), encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def write_json(name, value):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, name), "w", encoding="utf-8") as file:
+        json.dump(value, file)
+
+
+def notifications_on():
+    return bool(read_json("settings.json", {"notify": True}).get("notify", True))
+
+
+def send_notice(text):
+    try:
+        subprocess.run([NOTIFY_CMD, "Jarri", text], timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError):
+        pass  # no desktop notifications available; the panel still shows updates
+
+
+def notify_new_versions():
+    """Send one notice per new version. Versions already announced are remembered."""
+    told = read_json("notified.json", {})
+    for name, info in status()["services"].items():
+        if not info["updateAvailable"]:
+            continue
+        if told.get(name) == info["latest"]:
+            continue
+        send_notice(f"New version of {name} ({info['version']} -> {info['latest']}). Open Modules to update.")
+        told[name] = info["latest"]
+    write_json("notified.json", told)
+
+
+def background_checks():
+    time.sleep(60)
+    while True:
+        if notifications_on():
+            try:
+                notify_new_versions()
+            except Exception:
+                pass  # try again at the next round
+        time.sleep(CHECK_EVERY_S)
+
+
+def restart_service(name):
+    _directory, unit = SERVICES[name]
+    restart(unit)
+    return {"ok": True}
+
+
+def service_log(name):
+    _directory, unit = SERVICES[name]
+    result = subprocess.run(
+        ["journalctl", "--user", "-u", unit, "-n", "20", "--no-pager", "-o", "cat"],
+        capture_output=True, text=True, timeout=20,
+    )
+    return {"lines": result.stdout.splitlines()[-20:]}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "jarri-module-store"
 
@@ -211,6 +285,14 @@ class Handler(BaseHTTPRequestHandler):
         if not self._allowed():
             return self._send(403, {"error": "forbidden origin"})
         path = urlparse(self.path).path
+        if path == "/settings":
+            return self._send(200, {"notify": notifications_on()})
+        log_match = LOG_PATH.match(path)
+        if log_match and log_match.group(1) in SERVICES:
+            try:
+                return self._send(200, service_log(log_match.group(1)))
+            except Exception as error:
+                return self._send(500, {"error": str(error)})
         if path == "/apps":
             try:
                 self._send(200, {"apps": load_apps()})
@@ -227,18 +309,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self._allowed():
             return self._send(403, {"error": "forbidden origin"})
-        match = ACTION_PATH.match(urlparse(self.path).path)
+        path = urlparse(self.path).path
+        if path == "/settings":
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+            write_json("settings.json", {"notify": bool(body.get("notify", True))})
+            return self._send(200, {"notify": notifications_on()})
+        match = ACTION_PATH.match(path)
         if not match or match.group(2) not in SERVICES:
             return self._send(404, {"error": "unknown service"})
         action, name = match.group(1), match.group(2)
         try:
-            result = update(name) if action == "update" else undo(name)
+            if action == "update":
+                result = update(name)
+            elif action == "undo":
+                result = undo(name)
+            else:
+                result = restart_service(name)
             self._send(200, result)
         except Exception as error:
             self._send(500, {"error": str(error)})
 
 
 def main():
+    threading.Thread(target=background_checks, daemon=True).start()
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"jarri module store service on http://{HOST}:{PORT}", file=sys.stderr)
     server.serve_forever()
