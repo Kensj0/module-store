@@ -11,12 +11,13 @@ Backend only. The module store panel in Jarri is a client of this service.
   POST /update/{name}     -> {ok, updated, version}
   POST /undo/{name}       -> {ok, version}
 
-How it works: each service runs from its own folder, not from the git checkout.
+How it works: each service runs from its own folder, not from a git checkout.
+Each app's code comes from its own backend repo (backend.repo in apps.json).
 
   ~/.local/share/jarri-apps/<name>/current/server.py   runs now
   ~/.local/share/jarri-apps/<name>/previous/server.py  the version before the last update
 
-Update copies the latest code from origin/main into the folder and makes it current.
+Update copies the latest code from origin/main of that repo into the folder and makes it current.
 Undo swaps current and previous. Git is only read, never changed.
 
 Only installed services can be updated. Binds to 127.0.0.1 and accepts requests
@@ -43,6 +44,7 @@ STATE_DIR = os.path.expanduser(os.environ.get("JARRI_STATE_DIR", "~/.local/state
 NOTIFY_CMD = os.environ.get("JARRI_NOTIFY_CMD", "notify-send")
 CHECK_EVERY_S = int(os.environ.get("JARRI_CHECK_EVERY_S", str(30 * 60)))
 APPS_FILE = os.path.join(REPO, "apps.json")
+SOURCES = os.path.expanduser(os.environ.get("JARRI_SOURCES_DIR", "~/.local/state/jarri/module-store/sources"))
 
 
 def load_apps():
@@ -59,12 +61,12 @@ def app_installed(app):
     return installed_state().get(app["id"], app.get("installed", True))
 
 
-# Installed services that can be updated: name -> (folder, systemd unit).
+# Installed services that can be updated: name -> (backend repo URL, systemd unit).
 def services():
     return {
-        app["id"]: (app["dir"], app["unit"])
+        app["id"]: (app["backend"]["repo"], app["backend"]["unit"])
         for app in load_apps()
-        if app["kind"] == "service" and app_installed(app)
+        if "backend" in app and app_installed(app)
     }
 ALLOWED_ORIGINS = {
     "tauri://localhost",
@@ -81,17 +83,34 @@ INSTALL_PATH = re.compile(r"^/install/([a-z0-9-]+)$")
 LOG_PATH = re.compile(r"^/logs/([a-z0-9-]+)$")
 
 
-def git(*args, timeout=60):
+def git(*args, timeout=60, cwd=REPO):
     result = subprocess.run(
-        ["git", "-C", REPO, *args], capture_output=True, text=True, timeout=timeout
+        ["git", "-C", cwd, *args], capture_output=True, text=True, timeout=timeout
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "git failed")
     return result.stdout.strip()
 
 
-def latest_version(directory):
-    return git("log", "-1", "--format=%h", "origin/main", "--", directory) or "unknown"
+def source_dir(name):
+    """A local clone of the app's backend repo, kept only so the store can read its code."""
+    return os.path.join(SOURCES, name)
+
+
+def fetch_source(name, url):
+    path = source_dir(name)
+    if not os.path.isdir(os.path.join(path, ".git")):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        result = subprocess.run(
+            ["git", "clone", "--quiet", url, path], capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            raise RuntimeError("the app is not on GitHub yet, push it first" if "not found" in result.stderr.lower() else result.stderr.strip())
+    git("fetch", "--quiet", "origin", "main", timeout=60, cwd=path)
+
+
+def latest_version(name):
+    return git("log", "-1", "--format=%h", "origin/main", cwd=source_dir(name)) or "unknown"
 
 
 def service_dir(name):
@@ -122,11 +141,11 @@ def restart(unit):
 
 
 def status():
-    git("fetch", "--quiet", "origin", "main", timeout=30)
     found = {}
-    for name, (directory, _unit) in services().items():
+    for name, (url, _unit) in services().items():
+        fetch_source(name, url)
         version = installed(name)
-        latest = latest_version(directory)
+        latest = latest_version(name)
         found[name] = {
             "version": version,
             "latest": latest,
@@ -136,35 +155,38 @@ def status():
     return {"services": found}
 
 
-def copy_folder_into(staging, name, directory, ref="origin/main"):
-    """Write every tracked file of an app folder, from git, into the staging folder."""
+def copy_repo_into(staging, name, ref="origin/main"):
+    """Write every tracked file of the app's backend repo, from git, into the staging folder."""
+    cwd = source_dir(name)
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging)
-    for path in git("ls-tree", "-r", "--name-only", ref, "--", directory).splitlines():
-        content = git("show", f"{ref}:{path}")
-        with open(os.path.join(staging, os.path.basename(path)), "w", encoding="utf-8") as file:
+    for path in git("ls-tree", "-r", "--name-only", ref, cwd=cwd).splitlines():
+        content = git("show", f"{ref}:{path}", cwd=cwd)
+        target = os.path.join(staging, path)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as file:
             file.write(content + "\n")
 
 
 def install(name):
     """Install an app that is listed but not yet installed: copy it, add its unit, start it."""
     app = next((a for a in load_apps() if a["id"] == name), None)
-    if app is None or app["kind"] != "service":
-        raise RuntimeError("not an installable service")
+    if app is None or "backend" not in app:
+        raise RuntimeError("not an installable app")
     if app_installed(app):
         return {"ok": True, "installed": True}
-    git("fetch", "--quiet", "origin", "main", timeout=30)
-    directory, unit = app["dir"], app["unit"]
+    fetch_source(name, app["backend"]["repo"])
+    unit = app["backend"]["unit"]
     entry = app.get("entry", "server.py")
-    latest = latest_version(directory)
+    latest = latest_version(name)
     if latest == "unknown":
-        raise RuntimeError("the app is not on GitHub yet, push it first")
+        raise RuntimeError("the app has no commits on its main branch yet")
 
     base = service_dir(name)
     os.makedirs(base, exist_ok=True)
-    copy_folder_into(os.path.join(base, "current"), name, directory)
+    copy_repo_into(os.path.join(base, "current"), name)
     if not os.path.isfile(os.path.join(base, "current", entry)):
-        raise RuntimeError(f"{entry} is missing in {directory}")
+        raise RuntimeError(f"{entry} is missing in the {name} repo")
     with open(os.path.join(base, "current.version"), "w", encoding="utf-8") as file:
         file.write(latest + "\n")
 
@@ -191,22 +213,17 @@ def install(name):
 
 
 def update(name):
-    directory, unit = services()[name]
-    git("fetch", "--quiet", "origin", "main", timeout=30)
-    latest = latest_version(directory)
+    url, unit = services()[name]
+    fetch_source(name, url)
+    latest = latest_version(name)
     base = service_dir(name)
     if installed(name) == latest:
         return {"ok": True, "updated": False, "version": latest}
 
     # Build the new version next to the current one, then swap it in.
     staging = os.path.join(base, "staging")
-    shutil.rmtree(staging, ignore_errors=True)
-    os.makedirs(staging)
-    # Copy every tracked file in the app folder, so apps with more than one file work too.
-    for path in git("ls-tree", "-r", "--name-only", "origin/main", "--", directory).splitlines():
-        content = git("show", f"origin/main:{path}")
-        with open(os.path.join(staging, os.path.basename(path)), "w", encoding="utf-8") as file:
-            file.write(content + "\n")
+    # Copy every tracked file in the app's repo, so apps with more than one file work too.
+    copy_repo_into(staging, name)
     with open(os.path.join(staging, "version.txt"), "w", encoding="utf-8") as file:
         file.write(latest + "\n")
 
@@ -225,7 +242,7 @@ def update(name):
 
 
 def undo(name):
-    _directory, unit = services()[name]
+    _url, unit = services()[name]
     if not can_undo(name):
         raise RuntimeError("nothing to undo")
     base = service_dir(name)
@@ -300,13 +317,13 @@ def background_checks():
 
 
 def restart_service(name):
-    _directory, unit = services()[name]
+    _url, unit = services()[name]
     restart(unit)
     return {"ok": True}
 
 
 def service_log(name):
-    _directory, unit = services()[name]
+    _url, unit = services()[name]
     result = subprocess.run(
         ["journalctl", "--user", "-u", unit, "-n", "20", "--no-pager", "-o", "cat"],
         capture_output=True, text=True, timeout=20,
