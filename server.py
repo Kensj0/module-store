@@ -177,6 +177,9 @@ def install(name):
         return {"ok": True, "installed": True}
     fetch_source(name, app["backend"]["repo"])
     unit = app["backend"]["unit"]
+    unit_file = os.path.join(os.path.expanduser("~/.config/systemd/user"), f"{unit}.service")
+    if os.path.exists(unit_file):  # never overwrite a unit that is already set up, e.g. one that runs from a repo
+        raise RuntimeError(f"{unit} is already set up, so the store will not overwrite it")
     entry = app.get("entry", "server.py")
     latest = latest_version(name)
     if latest == "unknown":
