@@ -66,7 +66,7 @@ def services():
     return {
         app["id"]: (app["backend"]["repo"], app["backend"]["unit"])
         for app in load_apps()
-        if "backend" in app and app_installed(app)
+        if "backend" in app and app_installed(app) and app.get("updatable", True)
     }
 ALLOWED_ORIGINS = {
     "tauri://localhost",
