@@ -42,7 +42,7 @@ INSTALL_ROOT = os.path.expanduser(os.environ.get("JARRI_INSTALL_ROOT", "~/.local
 SKIP_RESTART = os.environ.get("JARRI_SKIP_RESTART") == "1"  # for tests only
 STATE_DIR = os.path.expanduser(os.environ.get("JARRI_STATE_DIR", "~/.local/state/jarri/module-store"))
 NOTIFY_CMD = os.environ.get("JARRI_NOTIFY_CMD", "notify-send")
-CHECK_EVERY_S = int(os.environ.get("JARRI_CHECK_EVERY_S", str(30 * 60)))
+CHECK_EVERY_S = int(os.environ.get("JARRI_CHECK_EVERY_S", str(10 * 60)))
 APPS_FILE = os.path.join(REPO, "apps.json")
 SOURCES = os.path.expanduser(os.environ.get("JARRI_SOURCES_DIR", "~/.local/state/jarri/module-store/sources"))
 
@@ -140,7 +140,12 @@ def restart(unit):
         subprocess.run(["systemctl", "--user", "restart", unit], check=True, timeout=30)
 
 
-def status():
+STATUS_CACHE = {"checkedAt": None, "services": None}
+STATUS_LOCK = threading.Lock()
+
+
+def status_now():
+    """Asks GitHub for every app. Slow (seconds), so only the background check calls it."""
     found = {}
     for name, (url, _unit) in services().items():
         fetch_source(name, url)
@@ -153,6 +158,19 @@ def status():
             "canUndo": can_undo(name),
         }
     return {"services": found}
+
+
+def refresh_status():
+    with STATUS_LOCK:
+        services = status_now()["services"]
+        STATUS_CACHE.update({"checkedAt": int(time.time()), "services": services})
+
+
+def status():
+    """The last known status. Answers at once; the background check keeps it fresh."""
+    if STATUS_CACHE["services"] is None:
+        refresh_status()
+    return {"checkedAt": STATUS_CACHE["checkedAt"], "services": STATUS_CACHE["services"]}
 
 
 def copy_repo_into(staging, name, ref="origin/main"):
@@ -311,6 +329,10 @@ def notify_new_versions():
 def background_checks():
     time.sleep(60)
     while True:
+        try:
+            refresh_status()
+        except Exception:
+            pass  # keep the last known status, try again at the next round
         if notifications_on():
             try:
                 notify_new_versions()
