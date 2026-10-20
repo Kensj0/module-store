@@ -109,6 +109,14 @@ def fetch_source(name, url):
     git("fetch", "--quiet", "origin", "main", timeout=60, cwd=path)
 
 
+def commit_date(name, ref):
+    """The commit's date (YYYY-MM-DD) in the app's own clone, or None if it is not known."""
+    try:
+        return git("show", "-s", "--format=%cs", ref, cwd=source_dir(name)) or None
+    except RuntimeError:
+        return None
+
+
 def latest_version(name):
     return git("log", "-1", "--format=%h", "origin/main", cwd=source_dir(name)) or "unknown"
 
@@ -156,6 +164,8 @@ def status_now():
             "latest": latest,
             "updateAvailable": version != latest,
             "canUndo": can_undo(name),
+            "installedDate": commit_date(name, version) if version != "unknown" else None,
+            "latestDate": commit_date(name, "origin/main"),
         }
     return {"services": found}
 
